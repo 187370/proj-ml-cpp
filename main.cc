@@ -15,8 +15,7 @@ static constexpr struct parameters{ // 可以用于调整的参数
 
 int main() { // 遗传算法本体
     Population<params.DIMENSION> population(
-        params.POPULATION_SIZE,
-        params.POINT_COUNT
+        params.POPULATION_SIZE
     ); // 初始化种群
 
     // 先输出一个初始最优解的信息
