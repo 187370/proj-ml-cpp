@@ -4,6 +4,7 @@
 #include <iomanip>
 #include <iostream>
 #include <limits>
+#include <numeric>
 #include <random>
 #include <sstream>
 #include <string>
@@ -18,10 +19,15 @@ struct SearchParams {
     std::size_t restarts = 60;
     std::size_t insert_candidates = 200;
     std::size_t insert_restarts = 20;
+    std::size_t basin_hops = 0;
     double step_start = 0.06;
     double step_end = 0.005;
     double repulsion = 0.01;
+    double repulsion_power = 3.0;
     double penalty_weight = 2.0;
+    double kick_scale = 0.03;
+    double accept_temp = 0.002;
+    double accept_decay = 0.9;
     double tolerance = 1e-6;
     double jitter = 0.0;
     std::size_t jitter_every = 200;
@@ -50,6 +56,16 @@ static void normalize(Point &p)
     }
 }
 
+static double dot_product(const Point &a, const Point &b)
+{
+    double sum = 0.0;
+    for (std::size_t i = 0; i < a.size(); ++i)
+    {
+        sum += a[i] * b[i];
+    }
+    return sum;
+}
+
 static Point random_unit_point(std::size_t dim, std::mt19937 &gen)
 {
     std::normal_distribution<double> dist(0.0, 1.0);
@@ -71,6 +87,65 @@ static Points random_points(std::size_t count, std::size_t dim, std::mt19937 &ge
         points.push_back(random_unit_point(dim, gen));
     }
     return points;
+}
+
+static std::vector<Point> orthonormalize(const std::vector<Point> &candidates, double tol = 1e-10)
+{
+    std::vector<Point> basis;
+    for (const auto &v : candidates)
+    {
+        Point w = v;
+        for (const auto &b : basis)
+        {
+            double proj = dot_product(w, b);
+            for (std::size_t i = 0; i < w.size(); ++i)
+            {
+                w[i] -= proj * b[i];
+            }
+        }
+        double norm_sq = dot_product(w, w);
+        if (norm_sq > tol * tol)
+        {
+            double inv_norm = 1.0 / std::sqrt(norm_sq);
+            for (double &x : w)
+            {
+                x *= inv_norm;
+            }
+            basis.push_back(std::move(w));
+        }
+    }
+    return basis;
+}
+
+static std::vector<Point> build_sum_zero_basis(std::size_t dim)
+{
+    std::vector<Point> candidates;
+    candidates.reserve(dim > 0 ? dim - 1 : 0);
+    for (std::size_t i = 0; i + 1 < dim; ++i)
+    {
+        Point v(dim, 0.0);
+        v[i] = 1.0;
+        v[dim - 1] = -1.0;
+        candidates.push_back(std::move(v));
+    }
+    return orthonormalize(candidates);
+}
+
+static Points project_points_to_basis(const Points &points, const std::vector<Point> &basis)
+{
+    Points projected;
+    projected.reserve(points.size());
+    for (const auto &p : points)
+    {
+        Point out(basis.size(), 0.0);
+        for (std::size_t i = 0; i < basis.size(); ++i)
+        {
+            out[i] = dot_product(p, basis[i]);
+        }
+        normalize(out);
+        projected.push_back(std::move(out));
+    }
+    return projected;
 }
 
 static double distance_squared(const Point &a, const Point &b)
@@ -182,12 +257,136 @@ static Points generate_e8_roots()
     return points;
 }
 
+static Points generate_e7_roots_8d()
+{
+    Points e8 = generate_e8_roots();
+    Points e7;
+    e7.reserve(126);
+    for (const auto &p : e8)
+    {
+        double sum = std::accumulate(p.begin(), p.end(), 0.0);
+        if (std::abs(sum) < 1e-9)
+        {
+            e7.push_back(p);
+        }
+    }
+    return e7;
+}
+
+static Points generate_e7_roots()
+{
+    Points e7_8d = generate_e7_roots_8d();
+    if (e7_8d.empty())
+    {
+        return {};
+    }
+    std::vector<Point> basis7 = build_sum_zero_basis(8);
+    return project_points_to_basis(e7_8d, basis7);
+}
+
+static Points generate_e6_roots()
+{
+    Points e8 = generate_e8_roots();
+    if (e8.empty())
+    {
+        return {};
+    }
+
+    const double tol = 1e-9;
+    Point ref1;
+    Point ref2;
+    bool found = false;
+
+    for (std::size_t i = 0; i < e8.size() && !found; ++i)
+    {
+        for (std::size_t j = i + 1; j < e8.size() && !found; ++j)
+        {
+            std::vector<Point> span = orthonormalize({e8[i], e8[j]});
+            if (span.size() != 2)
+            {
+                continue;
+            }
+            std::size_t count = 0;
+            for (const auto &p : e8)
+            {
+                if (std::abs(dot_product(p, span[0])) < tol &&
+                    std::abs(dot_product(p, span[1])) < tol)
+                {
+                    ++count;
+                }
+            }
+            if (count == 72)
+            {
+                ref1 = span[0];
+                ref2 = span[1];
+                found = true;
+            }
+        }
+    }
+
+    if (!found)
+    {
+        return {};
+    }
+
+    std::vector<Point> candidates;
+    candidates.reserve(8);
+    for (std::size_t k = 0; k < 8; ++k)
+    {
+        Point v(8, 0.0);
+        v[k] = 1.0;
+        double proj1 = dot_product(v, ref1);
+        double proj2 = dot_product(v, ref2);
+        for (std::size_t i = 0; i < v.size(); ++i)
+        {
+            v[i] -= proj1 * ref1[i] + proj2 * ref2[i];
+        }
+        candidates.push_back(std::move(v));
+    }
+
+    std::vector<Point> basis6 = orthonormalize(candidates);
+    if (basis6.size() != 6)
+    {
+        return {};
+    }
+
+    Points e6_8d;
+    e6_8d.reserve(72);
+    for (const auto &p : e8)
+    {
+        if (std::abs(dot_product(p, ref1)) < tol &&
+            std::abs(dot_product(p, ref2)) < tol)
+        {
+            e6_8d.push_back(p);
+        }
+    }
+    return project_points_to_basis(e6_8d, basis6);
+}
+
 static Points seed_points_for_dimension(std::size_t dim, std::string &label)
 {
     if (dim == 8)
     {
         label = "E8 roots";
         return generate_e8_roots();
+    }
+    if (dim == 7)
+    {
+        Points e7 = generate_e7_roots();
+        if (!e7.empty())
+        {
+            label = "E7 roots";
+            return e7;
+        }
+    }
+    if (dim == 6)
+    {
+        Points e6 = generate_e6_roots();
+        if (!e6.empty())
+        {
+            label = "E6 roots";
+            return e6;
+        }
     }
     if (dim >= 4)
     {
@@ -323,7 +522,7 @@ static bool optimize_points(Points &points, const SearchParams &params, std::mt1
 
                 if (params.repulsion > 0.0)
                 {
-                    double rep = params.repulsion / (dist2 * dist + eps);
+                    double rep = params.repulsion / std::pow(dist + eps, params.repulsion_power);
                     for (std::size_t d = 0; d < dim; ++d)
                     {
                         double push = diff[d] * rep;
@@ -371,6 +570,78 @@ static bool optimize_points(Points &points, const SearchParams &params, std::mt1
 
     out_min_dist2 = best_min_dist2;
     return false;
+}
+
+static void apply_kick(Points &points, double scale, std::mt19937 &gen)
+{
+    if (scale <= 0.0)
+    {
+        return;
+    }
+    std::normal_distribution<double> noise(0.0, scale);
+    for (auto &p : points)
+    {
+        for (double &v : p)
+        {
+            v += noise(gen);
+        }
+        normalize(p);
+    }
+}
+
+static bool basin_hopping_optimize(Points &points,
+                                   const SearchParams &params,
+                                   std::mt19937 &gen,
+                                   double &out_min_dist2)
+{
+    Points current = points;
+    double current_min = 0.0;
+    optimize_points(current, params, gen, current_min);
+
+    Points best = current;
+    double best_min = current_min;
+
+    double temperature = params.accept_temp;
+    std::uniform_real_distribution<double> uni(0.0, 1.0);
+
+    for (std::size_t hop = 0; hop < params.basin_hops; ++hop)
+    {
+        Points candidate = current;
+        apply_kick(candidate, params.kick_scale, gen);
+
+        double cand_min = 0.0;
+        optimize_points(candidate, params, gen, cand_min);
+
+        bool accept = false;
+        if (cand_min >= current_min)
+        {
+            accept = true;
+        }
+        else if (temperature > 0.0)
+        {
+            double delta = cand_min - current_min;
+            double prob = std::exp(delta / temperature);
+            accept = (uni(gen) < prob);
+        }
+
+        if (accept)
+        {
+            current = candidate;
+            current_min = cand_min;
+        }
+
+        if (cand_min > best_min)
+        {
+            best = candidate;
+            best_min = cand_min;
+        }
+
+        temperature *= params.accept_decay;
+    }
+
+    points = std::move(best);
+    out_min_dist2 = best_min;
+    return best_min >= 1.0 - params.tolerance;
 }
 
 static std::string format_points(const Points &points)
@@ -456,7 +727,10 @@ static void run_dimension(std::size_t dim,
                     continue;
                 }
                 double min_dist2 = 0.0;
-                if (optimize_points(attempt, params, gen, min_dist2))
+                bool ok = params.basin_hops > 0
+                              ? basin_hopping_optimize(attempt, params, gen, min_dist2)
+                              : optimize_points(attempt, params, gen, min_dist2);
+                if (ok)
                 {
                     success = true;
                     best_points = attempt;
@@ -473,7 +747,10 @@ static void run_dimension(std::size_t dim,
         {
             Points attempt = random_points(n, dim, gen);
             double min_dist2 = 0.0;
-            if (optimize_points(attempt, params, gen, min_dist2))
+            bool ok = params.basin_hops > 0
+                          ? basin_hopping_optimize(attempt, params, gen, min_dist2)
+                          : optimize_points(attempt, params, gen, min_dist2);
+            if (ok)
             {
                 success = true;
                 best_points = attempt;
@@ -524,10 +801,15 @@ static SearchParams default_params_for_dimension(std::size_t dim)
         params.restarts = 30;
         params.insert_candidates = 120;
         params.insert_restarts = 20;
+        params.basin_hops = 0;
         params.step_start = 0.05;
         params.step_end = 0.005;
         params.repulsion = 0.01;
+        params.repulsion_power = 3.0;
         params.penalty_weight = 2.0;
+        params.kick_scale = 0.02;
+        params.accept_temp = 0.001;
+        params.accept_decay = 0.9;
         params.jitter = 0.005;
         params.jitter_every = 200;
         params.tolerance = 1e-4;
@@ -538,10 +820,15 @@ static SearchParams default_params_for_dimension(std::size_t dim)
         params.restarts = 120;
         params.insert_candidates = 600;
         params.insert_restarts = 30;
+        params.basin_hops = 0;
         params.step_start = 0.08;
         params.step_end = 0.005;
         params.repulsion = 0.02;
+        params.repulsion_power = 3.0;
         params.penalty_weight = 4.0;
+        params.kick_scale = 0.02;
+        params.accept_temp = 0.001;
+        params.accept_decay = 0.9;
         params.jitter = 0.01;
         params.jitter_every = 200;
         params.tolerance = 1e-6;
@@ -552,10 +839,15 @@ static SearchParams default_params_for_dimension(std::size_t dim)
         params.restarts = 20;
         params.insert_candidates = 200;
         params.insert_restarts = 20;
+        params.basin_hops = 6;
         params.step_start = 0.05;
         params.step_end = 0.004;
         params.repulsion = 0.01;
+        params.repulsion_power = 3.0;
         params.penalty_weight = 2.5;
+        params.kick_scale = 0.03;
+        params.accept_temp = 0.002;
+        params.accept_decay = 0.9;
         params.jitter = 0.006;
         params.jitter_every = 200;
         params.tolerance = 1e-6;
@@ -566,10 +858,15 @@ static SearchParams default_params_for_dimension(std::size_t dim)
         params.restarts = 0;
         params.insert_candidates = 400;
         params.insert_restarts = 10;
+        params.basin_hops = 4;
         params.step_start = 0.05;
         params.step_end = 0.003;
         params.repulsion = 0.01;
+        params.repulsion_power = 3.0;
         params.penalty_weight = 2.0;
+        params.kick_scale = 0.02;
+        params.accept_temp = 0.001;
+        params.accept_decay = 0.9;
         params.jitter = 0.004;
         params.jitter_every = 200;
         params.tolerance = 1e-6;
@@ -580,10 +877,15 @@ static SearchParams default_params_for_dimension(std::size_t dim)
         params.restarts = 0;
         params.insert_candidates = 600;
         params.insert_restarts = 8;
+        params.basin_hops = 4;
         params.step_start = 0.04;
         params.step_end = 0.002;
         params.repulsion = 0.01;
+        params.repulsion_power = 3.0;
         params.penalty_weight = 3.0;
+        params.kick_scale = 0.01;
+        params.accept_temp = 0.001;
+        params.accept_decay = 0.9;
         params.jitter = 0.003;
         params.jitter_every = 250;
         params.tolerance = 1e-6;
@@ -594,10 +896,15 @@ static SearchParams default_params_for_dimension(std::size_t dim)
         params.restarts = 20;
         params.insert_candidates = 200;
         params.insert_restarts = 10;
+        params.basin_hops = 8;
         params.step_start = 0.05;
         params.step_end = 0.003;
         params.repulsion = 0.01;
+        params.repulsion_power = 3.0;
         params.penalty_weight = 2.0;
+        params.kick_scale = 0.03;
+        params.accept_temp = 0.002;
+        params.accept_decay = 0.9;
         params.jitter = 0.005;
         params.jitter_every = 200;
         params.tolerance = 1e-6;
@@ -619,6 +926,14 @@ static std::size_t default_target_for_dimension(std::size_t dim)
     {
         return 30;
     }
+    if (dim == 6)
+    {
+        return 72;
+    }
+    if (dim == 7)
+    {
+        return 126;
+    }
     if (dim == 8)
     {
         return 245;
@@ -632,32 +947,40 @@ static std::size_t default_target_for_dimension(std::size_t dim)
 
 int main(int argc, char **argv)
 {
-    if (argc > 1 && std::string(argv[1]) == "--dim")
+    bool no_seed = false;
+    int argi = 1;
+    if (argi < argc && std::string(argv[argi]) == "--no-seed")
     {
-        if (argc < 3)
+        no_seed = true;
+        ++argi;
+    }
+
+    if (argi < argc && std::string(argv[argi]) == "--dim")
+    {
+        if (argi + 1 >= argc)
         {
             std::cerr << "Usage: " << argv[0] << " --dim <D> [target]" << std::endl;
             return 1;
         }
-        std::size_t dim = static_cast<std::size_t>(std::stoul(argv[2]));
-        std::size_t target = (argc > 3) ? static_cast<std::size_t>(std::stoul(argv[3]))
-                                        : default_target_for_dimension(dim);
+        std::size_t dim = static_cast<std::size_t>(std::stoul(argv[argi + 1]));
+        std::size_t target = (argi + 2 < argc) ? static_cast<std::size_t>(std::stoul(argv[argi + 2]))
+                                               : default_target_for_dimension(dim);
 
         std::string seed_label;
-        Points seed_points = seed_points_for_dimension(dim, seed_label);
+        Points seed_points = no_seed ? Points{} : seed_points_for_dimension(dim, seed_label);
         SearchParams params = default_params_for_dimension(dim);
 
         run_dimension(dim, target, params, seed_points, seed_label);
         return 0;
     }
 
-    if (argc > 1)
+    if (argi < argc)
     {
-        std::string seed_path = argv[1];
+        std::string seed_path = argv[argi];
         std::size_t target = 0;
-        if (argc > 2)
+        if (argi + 1 < argc)
         {
-            target = static_cast<std::size_t>(std::stoul(argv[2]));
+            target = static_cast<std::size_t>(std::stoul(argv[argi + 1]));
         }
 
         Points seed_points;
@@ -685,12 +1008,12 @@ int main(int argc, char **argv)
     run_dimension(3, default_target_for_dimension(3), params3, {}, "");
 
     std::string seed_label;
-    Points seed4 = seed_points_for_dimension(4, seed_label);
+    Points seed4 = no_seed ? Points{} : seed_points_for_dimension(4, seed_label);
     SearchParams params4 = default_params_for_dimension(4);
     run_dimension(4, default_target_for_dimension(4), params4, seed4, seed_label);
 
     seed_label.clear();
-    Points seed8 = seed_points_for_dimension(8, seed_label);
+    Points seed8 = no_seed ? Points{} : seed_points_for_dimension(8, seed_label);
     SearchParams params8 = default_params_for_dimension(8);
     run_dimension(8, default_target_for_dimension(8), params8, seed8, seed_label);
 
